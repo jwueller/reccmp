@@ -30,11 +30,13 @@ from .match_msvc import (
     match_static_variables,
     match_variables,
     match_strings,
+    match_unpooled_strings,
     match_ref,
     match_imports,
 )
 from .db import EntityDb, ReccmpEntity, ReccmpMatch
 from .lines import LinesDb
+from .objects import ObjectDataRegions
 from .report import ReccmpComparedEntity, ReccmpStatusReport
 from .analyze import (
     create_imports,
@@ -244,6 +246,18 @@ class Compare:
         unique_names_for_overloaded_functions(self._db)
         name_thunks(self._db)
 
+        # This comes before the search for strings in the binary, which
+        # would create entities that match by text across all object files.
+        match_unpooled_strings(
+            self._db,
+            self.orig_bin,
+            self.recomp_bin,
+            ObjectDataRegions(
+                self.cvdump_analysis, self._lines_db, self.recomp_bin
+            ).get,
+            self.report,
+        )
+
         # Search for const data values and read bytes from the binaries.
         # This happens last because establishing all other entities first
         # will reduce false positives. For each address presumed to be a
@@ -275,6 +289,7 @@ class Compare:
             .publics()
             .symbols()
             .section_contributions()
+            .modules()
             .types()
             .run()
         )
