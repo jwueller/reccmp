@@ -385,6 +385,11 @@ def match_strings(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
         if not text:
             continue
 
+        # This copy belongs to an object file where each annotation of
+        # the text has its match. Do not give it to another file.
+        if ent.get("unpooled_copy"):
+            continue
+
         assert ent.recomp_addr is not None
         string_index.add(text, ent.recomp_addr)
 
@@ -428,6 +433,7 @@ def match_unpooled_strings(
     If the object has more copies than annotations, the best copies are
     matched and the others become unmatched string entities with the same text.
     So do the copies in the files named by the `other_filenames` attribute.
+    These have the `unpooled_copy` attribute.
 
     Recomp addresses at or inside an existing entity are not candidates.
     A string that has a symbol is left for match_strings."""
@@ -459,6 +465,8 @@ def match_unpooled_strings(
         for other_filename in ent.get("other_filenames", []):
             other_files.append((ent.orig_addr, raw, other_filename))
 
+    # Every address inside a string from this function. The entities are
+    # not in the database until the batch is done.
     used_addrs: set[int] = set()
     region_data: dict[range, bytes] = {}
 
@@ -471,6 +479,10 @@ def match_unpooled_strings(
         other data. A literal starts where the previous item ends and has the
         alignment of the orig string."""
         candidates: list[tuple[bool, int]] = []
+
+        # See entity_name_from_string. In a wide string, the high byte of
+        # most characters is null, so check the whole character.
+        char_size = 2 if names[orig_addr][1].startswith('L"') else 1
 
         for region in regions_for_file(filename):
             if region not in region_data:
@@ -486,7 +498,9 @@ def match_unpooled_strings(
                 addr = region.start + pos
                 if addr not in used_addrs and not db.intersects(ImageId.RECOMP, addr):
                     aligned = (addr - orig_addr) % 4 == 0
-                    follows_terminator = pos == 0 or data[pos - 1] == 0
+                    follows_terminator = pos == 0 or (
+                        pos >= char_size and not any(data[pos - char_size : pos])
+                    )
                     candidates.append((not (aligned and follows_terminator), addr))
 
                 pos = data.find(raw, pos + 1)
@@ -497,14 +511,23 @@ def match_unpooled_strings(
 
     with db.batch() as batch:
 
-        def add_string(recomp_addr: int, orig_addr: int, raw: bytes):
+        def add_string(
+            recomp_addr: int, orig_addr: int, raw: bytes, matched: bool = False
+        ):
             entity_type, text = names[orig_addr]
-            used_addrs.add(recomp_addr)
+            used_addrs.update(range(recomp_addr, recomp_addr + len(raw)))
             batch.set(
                 ImageId.RECOMP, recomp_addr, type=entity_type, name=text, size=len(raw)
             )
+            if matched:
+                batch.match(orig_addr, recomp_addr)
+            else:
+                batch.set(ImageId.RECOMP, recomp_addr, unpooled_copy=True)
 
-        for (filename, raw), orig_addrs in groups.items():
+        # Longest first, so that no shorter string can take the tail of a longer one.
+        for (filename, raw), orig_addrs in sorted(
+            groups.items(), key=lambda group: -len(group[0][1])
+        ):
             orig_addrs.sort()
             candidates, literals = find_candidates(filename, raw, orig_addrs[0])
 
@@ -519,8 +542,7 @@ def match_unpooled_strings(
                 )
 
             for orig_addr, recomp_addr in zip(orig_addrs, candidates):
-                add_string(recomp_addr, orig_addr, raw)
-                batch.match(orig_addr, recomp_addr)
+                add_string(recomp_addr, orig_addr, raw, matched=True)
 
             # Without string pooling, the compiler can emit one copy of a
             # literal for each use. An address can match only once, so name

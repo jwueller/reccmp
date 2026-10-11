@@ -215,6 +215,74 @@ def test_widechar(db):
     assert db.get(ImageId.RECOMP, RECOMP_BASE + 4).size(ImageId.RECOMP) == len(raw)
 
 
+def test_widechar_tail_is_not_a_literal(db, report):
+    """The high byte of the character before the tail is null.
+    That does not make the tail a literal of its own."""
+    raw = "1".encode("utf-16-le") + b"\0\0"
+    longer = "ab1".encode("utf-16-le") + b"\0\0"
+    orig = RawImage.from_memory(raw, base_addr=ORIG_BASE)
+    recomp = RawImage.from_memory(longer + raw, base_addr=RECOMP_BASE)
+
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            ORIG_BASE,
+            type=EntityType.STRING,
+            name='L"1"',
+            filename="a.cpp",
+            size=len(raw),
+        )
+
+    lookup = {"a.cpp": [range(RECOMP_BASE, RECOMP_BASE + 12)]}
+    match_unpooled_strings(db, orig, recomp, regions(lookup), report)
+
+    assert db.get(ImageId.ORIG, ORIG_BASE).recomp_addr == RECOMP_BASE + 8
+    assert db.get(ImageId.RECOMP, RECOMP_BASE + 4) is None
+    report.assert_not_called()
+
+
+def test_tail_of_string_from_same_pass(db):
+    """No match with the tail of a longer string that is matched in the same pass."""
+    orig = RawImage.from_memory(b"hello\0\0\0lo\0", base_addr=ORIG_BASE)
+    recomp = RawImage.from_memory(b"hello\0", base_addr=RECOMP_BASE)
+    add_orig_string(db, ORIG_BASE + 8, b"lo", "a.cpp")
+    add_orig_string(db, ORIG_BASE, b"hello", "a.cpp")
+
+    lookup = {"a.cpp": [range(RECOMP_BASE, RECOMP_BASE + 6)]}
+    match_unpooled_strings(db, orig, recomp, regions(lookup))
+
+    assert db.get(ImageId.ORIG, ORIG_BASE).recomp_addr == RECOMP_BASE
+    assert db.get(ImageId.ORIG, ORIG_BASE + 8).recomp_addr is None
+
+
+def test_copy_is_not_matched_by_text(db):
+    """An unmatched copy in one object file is not a match for the
+    annotation in another file. That one matches the string with a symbol."""
+    orig = RawImage.from_memory(b"hello\0\0\0hello\0\0\0", base_addr=ORIG_BASE)
+    recomp = RawImage.from_memory(
+        b"hello\0\0\0hello\0\0\0hello\0\0\0", base_addr=RECOMP_BASE
+    )
+    add_orig_string(db, ORIG_BASE, b"hello", "pooled.cpp")
+    add_orig_string(db, ORIG_BASE + 8, b"hello", "unpooled.cpp")
+
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP,
+            RECOMP_BASE + 16,
+            type=EntityType.STRING,
+            name='"hello"',
+            size=6,
+        )
+
+    lookup = {"unpooled.cpp": [range(RECOMP_BASE, RECOMP_BASE + 16)]}
+    match_unpooled_strings(db, orig, recomp, regions(lookup))
+    match_strings(db)
+
+    assert db.get(ImageId.ORIG, ORIG_BASE + 8).recomp_addr == RECOMP_BASE
+    assert db.get(ImageId.RECOMP, RECOMP_BASE + 8).orig_addr is None
+    assert db.get(ImageId.ORIG, ORIG_BASE).recomp_addr == RECOMP_BASE + 16
+
+
 def test_empty_string_skipped(db):
     orig = RawImage.from_memory(b"\0", base_addr=ORIG_BASE)
     recomp = RawImage.from_memory(b"\0\0\0\0", base_addr=RECOMP_BASE)
