@@ -1,3 +1,9 @@
+from typing import Callable, Iterable
+from reccmp.formats import Image
+from reccmp.formats.exceptions import (
+    InvalidVirtualAddressError,
+    InvalidVirtualReadError,
+)
 from reccmp.types import EntityType
 from reccmp.compare.db import EntityDb
 from reccmp.compare.lines import LinesDb
@@ -403,6 +409,109 @@ def match_strings(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
                     ent.orig_addr,
                     msg=f"Failed to match string {text} at 0x{ent.orig_addr:x}",
                 )
+
+
+def match_unpooled_strings(
+    db: EntityDb,
+    orig_bin: Image,
+    recomp_bin: Image,
+    regions_for_file: Callable[[str], Iterable[range]],
+    report: ReccmpReportProtocol = reccmp_report_nop,
+):
+    """Match annotated strings to string literals that have no symbol in the recomp.
+    Without string pooling (/GF), MSVC emits each literal into the data of its
+    object file without a ??_C@ symbol, so identical text in two object files
+    is two copies. To pair each copy with the right annotation, search for the
+    bytes of the orig string only in the recomp address ranges that
+    `regions_for_file` returns for the file that has the annotation.
+
+    Recomp addresses at or inside an existing entity are not candidates.
+    A string that has a symbol is left for match_strings."""
+
+    # Annotations in the same file for the same bytes compete for the same candidates.
+    groups: dict[tuple[str, bytes], list[int]] = {}
+    names: dict[int, tuple[EntityType, str]] = {}
+
+    for ent in db.unmatched(ImageId.ORIG):
+        if ent.get("type") not in (EntityType.STRING, EntityType.WIDECHAR):
+            continue
+
+        filename = ent.get("filename")
+        text = ent.get("name")
+        size = ent.size(ImageId.ORIG)
+        if not filename or not text or not size:
+            continue
+
+        assert ent.orig_addr is not None
+        raw = orig_bin.read(ent.orig_addr, size)
+
+        # The empty string is found at every null byte.
+        if not any(raw):
+            continue
+
+        groups.setdefault((filename, raw), []).append(ent.orig_addr)
+        names[ent.orig_addr] = (ent.get("type"), text)
+
+    used_addrs: set[int] = set()
+    region_data: dict[range, bytes] = {}
+
+    with db.batch() as batch:
+        for (filename, raw), orig_addrs in groups.items():
+            orig_addrs.sort()
+
+            # The search can hit the tail of a longer string or the middle of
+            # other data. A literal starts where the previous item ends and
+            # has the alignment of the orig string, so rank those hits first.
+            candidates: list[tuple[int, int]] = []
+
+            for region in regions_for_file(filename):
+                if region not in region_data:
+                    try:
+                        region_data[region] = recomp_bin.read(region.start, len(region))
+                    except (InvalidVirtualAddressError, InvalidVirtualReadError):
+                        region_data[region] = b""
+
+                data = region_data[region]
+
+                pos = data.find(raw)
+                while pos != -1:
+                    addr = region.start + pos
+                    if addr not in used_addrs and not db.intersects(
+                        ImageId.RECOMP, addr
+                    ):
+                        aligned = (addr - orig_addrs[0]) % 4 == 0
+                        follows_terminator = pos == 0 or data[pos - 1] == 0
+                        candidates.append((-(aligned + follows_terminator), addr))
+
+                    pos = data.find(raw, pos + 1)
+
+            candidates.sort()
+
+            # If the last candidate we use and the first one we don't have the
+            # same rank, only their address order decided between them.
+            taken = len(orig_addrs)
+            if (
+                len(candidates) > taken
+                and candidates[taken - 1][0] == candidates[taken][0]
+            ):
+                report(
+                    ReccmpEvent.AMBIGUOUS_MATCH,
+                    orig_addrs[0],
+                    msg=f"Ambiguous match 0x{orig_addrs[0]:x} on string {names[orig_addrs[0]][1]} in {filename}. Candidates: "
+                    + ", ".join(f"0x{addr:x}" for _, addr in candidates),
+                )
+
+            for orig_addr, (_, recomp_addr) in zip(orig_addrs, candidates):
+                entity_type, text = names[orig_addr]
+                used_addrs.add(recomp_addr)
+                batch.set(
+                    ImageId.RECOMP,
+                    recomp_addr,
+                    type=entity_type,
+                    name=text,
+                    size=len(raw),
+                )
+                batch.match(orig_addr, recomp_addr)
 
 
 def match_lines(
