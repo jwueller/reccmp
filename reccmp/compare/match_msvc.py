@@ -425,12 +425,17 @@ def match_unpooled_strings(
     bytes of the orig string only in the recomp address ranges that
     `regions_for_file` returns for the file that has the annotation.
 
+    If the object has more copies than annotations, the best copies are
+    matched and the others become unmatched string entities with the same text.
+    So do the copies in the files named by the `other_filenames` attribute.
+
     Recomp addresses at or inside an existing entity are not candidates.
     A string that has a symbol is left for match_strings."""
 
     # Annotations in the same file for the same bytes compete for the same candidates.
     groups: dict[tuple[str, bytes], list[int]] = {}
     names: dict[int, tuple[EntityType, str]] = {}
+    other_files: list[tuple[int, bytes, str]] = []
 
     for ent in db.unmatched(ImageId.ORIG):
         if ent.get("type") not in (EntityType.STRING, EntityType.WIDECHAR):
@@ -451,67 +456,84 @@ def match_unpooled_strings(
 
         groups.setdefault((filename, raw), []).append(ent.orig_addr)
         names[ent.orig_addr] = (ent.get("type"), text)
+        for other_filename in ent.get("other_filenames", []):
+            other_files.append((ent.orig_addr, raw, other_filename))
 
     used_addrs: set[int] = set()
     region_data: dict[range, bytes] = {}
 
+    def find_candidates(
+        filename: str, raw: bytes, orig_addr: int
+    ) -> tuple[list[int], int]:
+        """Returns the recomp addresses where the bytes are found, and how many
+        from the start of the list are sure to be a literal of its own.
+        The search can also hit the tail of a longer string or the middle of
+        other data. A literal starts where the previous item ends and has the
+        alignment of the orig string."""
+        candidates: list[tuple[bool, int]] = []
+
+        for region in regions_for_file(filename):
+            if region not in region_data:
+                try:
+                    region_data[region] = recomp_bin.read(region.start, len(region))
+                except (InvalidVirtualAddressError, InvalidVirtualReadError):
+                    region_data[region] = b""
+
+            data = region_data[region]
+
+            pos = data.find(raw)
+            while pos != -1:
+                addr = region.start + pos
+                if addr not in used_addrs and not db.intersects(ImageId.RECOMP, addr):
+                    aligned = (addr - orig_addr) % 4 == 0
+                    follows_terminator = pos == 0 or data[pos - 1] == 0
+                    candidates.append((not (aligned and follows_terminator), addr))
+
+                pos = data.find(raw, pos + 1)
+
+        candidates.sort()
+        literals = sum(1 for unsure, _ in candidates if not unsure)
+        return [addr for _, addr in candidates], literals
+
     with db.batch() as batch:
+
+        def add_string(recomp_addr: int, orig_addr: int, raw: bytes):
+            entity_type, text = names[orig_addr]
+            used_addrs.add(recomp_addr)
+            batch.set(
+                ImageId.RECOMP, recomp_addr, type=entity_type, name=text, size=len(raw)
+            )
+
         for (filename, raw), orig_addrs in groups.items():
             orig_addrs.sort()
+            candidates, literals = find_candidates(filename, raw, orig_addrs[0])
 
-            # The search can hit the tail of a longer string or the middle of
-            # other data. A literal starts where the previous item ends and
-            # has the alignment of the orig string, so rank those hits first.
-            candidates: list[tuple[int, int]] = []
-
-            for region in regions_for_file(filename):
-                if region not in region_data:
-                    try:
-                        region_data[region] = recomp_bin.read(region.start, len(region))
-                    except (InvalidVirtualAddressError, InvalidVirtualReadError):
-                        region_data[region] = b""
-
-                data = region_data[region]
-
-                pos = data.find(raw)
-                while pos != -1:
-                    addr = region.start + pos
-                    if addr not in used_addrs and not db.intersects(
-                        ImageId.RECOMP, addr
-                    ):
-                        aligned = (addr - orig_addrs[0]) % 4 == 0
-                        follows_terminator = pos == 0 or data[pos - 1] == 0
-                        candidates.append((-(aligned + follows_terminator), addr))
-
-                    pos = data.find(raw, pos + 1)
-
-            candidates.sort()
-
-            # If the last candidate we use and the first one we don't have the
-            # same rank, only their address order decided between them.
-            taken = len(orig_addrs)
-            if (
-                len(candidates) > taken
-                and candidates[taken - 1][0] == candidates[taken][0]
-            ):
+            # With more literals than annotations, only the address order
+            # decides which of them we match.
+            if literals > len(orig_addrs):
                 report(
                     ReccmpEvent.AMBIGUOUS_MATCH,
                     orig_addrs[0],
                     msg=f"Ambiguous match 0x{orig_addrs[0]:x} on string {names[orig_addrs[0]][1]} in {filename}. Candidates: "
-                    + ", ".join(f"0x{addr:x}" for _, addr in candidates),
+                    + ", ".join(f"0x{addr:x}" for addr in candidates[:literals]),
                 )
 
-            for orig_addr, (_, recomp_addr) in zip(orig_addrs, candidates):
-                entity_type, text = names[orig_addr]
-                used_addrs.add(recomp_addr)
-                batch.set(
-                    ImageId.RECOMP,
-                    recomp_addr,
-                    type=entity_type,
-                    name=text,
-                    size=len(raw),
-                )
+            for orig_addr, recomp_addr in zip(orig_addrs, candidates):
+                add_string(recomp_addr, orig_addr, raw)
                 batch.match(orig_addr, recomp_addr)
+
+            # Without string pooling, the compiler can emit one copy of a
+            # literal for each use. An address can match only once, so name
+            # the other copies: code that refers to them then compares equal
+            # to code that refers to the orig string.
+            for recomp_addr in candidates[len(orig_addrs) : literals]:
+                add_string(recomp_addr, orig_addrs[0], raw)
+
+        # The same goes for the copies in the other files that annotate the string.
+        for orig_addr, raw, filename in other_files:
+            candidates, literals = find_candidates(filename, raw, orig_addr)
+            for recomp_addr in candidates[:literals]:
+                add_string(recomp_addr, orig_addr, raw)
 
 
 def match_lines(

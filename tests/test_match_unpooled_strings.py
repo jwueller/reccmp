@@ -132,6 +132,9 @@ def test_prefer_start_of_literal(db, report):
     assert db.get(ImageId.ORIG, ORIG_BASE).recomp_addr == RECOMP_BASE + 8
     report.assert_not_called()
 
+    # No entity for the tail of the longer string.
+    assert db.get(ImageId.RECOMP, RECOMP_BASE + 3) is None
+
 
 def test_duplicates_in_one_file(db, report):
     """Two annotations and two copies in the same object match in address order."""
@@ -159,6 +162,35 @@ def test_ambiguous(db, report):
 
     assert db.get(ImageId.ORIG, ORIG_BASE).recomp_addr == RECOMP_BASE
     report.assert_called_with(ReccmpEvent.AMBIGUOUS_MATCH, ORIG_BASE, msg=ANY)
+
+    # The other copy is a string entity with the same name, but not matched.
+    other = db.get(ImageId.RECOMP, RECOMP_BASE + 8)
+    assert other.orig_addr is None
+    assert other.get("type") == EntityType.STRING
+    assert other.name == '"hello"'
+    assert other.size(ImageId.RECOMP) == 6
+
+
+def test_other_filenames(db, report):
+    """A string annotated in two files matches the copy in the first file.
+    The copy in the other file gets the same name."""
+    orig = RawImage.from_memory(b"hello\0", base_addr=ORIG_BASE)
+    recomp = RawImage.from_memory(b"hello\0\0\0hello\0\0\0", base_addr=RECOMP_BASE)
+    add_orig_string(db, ORIG_BASE, b"hello", "a.cpp")
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, ORIG_BASE, other_filenames=["b.cpp"])
+
+    lookup = {
+        "a.cpp": [range(RECOMP_BASE + 8, RECOMP_BASE + 16)],
+        "b.cpp": [range(RECOMP_BASE, RECOMP_BASE + 8)],
+    }
+    match_unpooled_strings(db, orig, recomp, regions(lookup), report)
+
+    assert db.get(ImageId.ORIG, ORIG_BASE).recomp_addr == RECOMP_BASE + 8
+    other = db.get(ImageId.RECOMP, RECOMP_BASE)
+    assert other.orig_addr is None
+    assert other.name == '"hello"'
+    report.assert_not_called()
 
 
 def test_widechar(db):
@@ -230,6 +262,9 @@ def fixture_cvdump_analysis() -> CvdumpAnalysis:
         0001 "a.obj"
         0002 "CMakeFiles/game.dir/src/b.cpp.obj"
         0003 "tables.obj"
+        0004 "strings_c.obj"
+        0005 "dup.obj"
+        0006 "lib/dup.obj"
         """),
     )
     parser.read_section(
@@ -241,6 +276,9 @@ def fixture_cvdump_analysis() -> CvdumpAnalysis:
           0002  0002:00000020  00000030  C0300040
           0003  0002:00000050  00000010  C0300040
           0003  0005:00000000  00000010  C0300040
+          0004  0002:00000060  00000010  C0300040
+          0005  0002:00000070  00000010  C0300040
+          0006  0002:00000080  00000010  C0300040
         """),
     )
     return CvdumpAnalysis(parser)
@@ -289,4 +327,10 @@ def test_regions_by_object_name(cvdump_analysis, recomp_bin):
     assert object_regions.get(PurePath("src/b.cpp")) == [
         range(DATA_START + 0x20, DATA_START + 0x50)
     ]
+    assert object_regions.get(PurePath("src/strings.c")) == [
+        range(DATA_START + 0x60, DATA_START + 0x70)
+    ]
     assert not object_regions.get(PurePath("src/unknown.cpp"))
+
+    # Two object files with this name
+    assert not object_regions.get(PurePath("src/dup.cpp"))

@@ -12,7 +12,7 @@ from reccmp.formats import Image, PEImage, TextFile
 from reccmp.cvdump import CvdumpTypesParser, CvdumpAnalysis
 from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases
-from reccmp.parser.node import ParserVtable
+from reccmp.parser.node import ParserString, ParserVtable
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.event import (
     ReccmpEvent,
@@ -172,7 +172,14 @@ def load_markers(
     # Make sure each address is used only once
     duplicate_annotations = codebase.prune_reused_addrs()
 
+    # A string can be used in several files, but only one annotation is kept.
+    # Remember the other files: each can have its own copy in the recomp.
+    string_other_filenames: dict[int, list[str]] = {}
+
     for sym in duplicate_annotations:
+        if isinstance(sym, ParserString):
+            string_other_filenames.setdefault(sym.offset, []).append(str(sym.filename))
+
         report(
             ReccmpEvent.INVALID_USER_DATA,
             sym.offset,
@@ -290,6 +297,13 @@ def load_markers(
                 name=entity_name_from_string(string.name, wide=string.is_widechar),
                 type=EntityType.STRING,
                 filename=str(string.filename),
+                other_filenames=[
+                    filename
+                    for filename in dict.fromkeys(
+                        string_other_filenames.get(string.offset, [])
+                    )
+                    if filename != str(string.filename)
+                ],
                 size=string_size,
                 verified=True,
             )

@@ -2,10 +2,16 @@
 compiled from a given source file."""
 
 import bisect
+import re
 from pathlib import PurePath, PureWindowsPath
 from reccmp.cvdump import CvdumpAnalysis
 from reccmp.formats import PEImage
 from .lines import LinesDb
+
+
+def _normalize(name: str) -> str:
+    """Build systems differ in how they join the file name and its extension."""
+    return re.sub(r"[^a-z0-9]", "_", name.lower())
 
 
 class ObjectDataRegions:
@@ -39,11 +45,11 @@ class ObjectDataRegions:
 
         self._contribs.sort()
 
-        self._modules_by_stem: dict[str, list[int]] = {}
+        # Object file name without its extension -> module ids.
+        self._modules_by_name: dict[str, list[int]] = {}
         for module in cvdump_analysis.parser.modules:
-            # e.g. "main.obj" or "CMakeFiles/game.dir/src/main.cpp.obj"
-            stem = PureWindowsPath(module.obj).name.lower().split(".")[0]
-            self._modules_by_stem.setdefault(stem, []).append(module.id)
+            name = PureWindowsPath(module.obj).stem
+            self._modules_by_name.setdefault(_normalize(name), []).append(module.id)
 
     def _module_at(self, addr: int) -> int | None:
         i = bisect.bisect_right(self._contribs, (addr, float("inf"), 0)) - 1
@@ -67,11 +73,16 @@ class ObjectDataRegions:
             return modules
 
         # Agent's choice: a file without code (e.g. only data tables) has no
-        # line numbers, so fall back to a module whose object file has the
-        # same name. Used only if the name is unique. The alternative is to
-        # leave such files without a module.
-        candidates = self._modules_by_stem.get(local_path.stem.lower(), [])
-        return set(candidates) if len(candidates) == 1 else set()
+        # line numbers, so fall back to a module whose object file is named
+        # after the file: with its extension (main.cpp.obj, main_cpp.obj) or
+        # without (main.obj). Used only if the name is unique. The alternative
+        # is to leave such files without a module.
+        for name in (local_path.name, local_path.stem):
+            candidates = self._modules_by_name.get(_normalize(name), [])
+            if len(candidates) == 1:
+                return set(candidates)
+
+        return set()
 
     def get(self, local_path: str | PurePath) -> list[range]:
         if not isinstance(local_path, PurePath):
